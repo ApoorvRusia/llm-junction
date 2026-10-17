@@ -1,11 +1,12 @@
 # LLM Junction
 
-One command to talk to other LLMs through a single [OpenRouter](https://openrouter.ai)
-API key. Ask a question, keep a multi-turn thread going, or run the same prompt
-past several models and compare answers — from your terminal.
+A switchboard for talking to other LLMs.
 
-Free-tier-first: it defaults to free models and refuses paid ones unless you
-explicitly allow them.
+The idea: one agent or system that has no direct access to other LLMs plugs
+into the junction, and the junction connects it to whichever models are
+plugged in on the other side. Providers are pluggable — OpenRouter ships as
+the first one (300+ models through a single key); any OpenAI-compatible API
+can be added and is then addressable as `provider::model`.
 
 ## Setup
 
@@ -14,16 +15,19 @@ No dependencies — Python 3.10+ and the standard library only.
 ```bash
 export OPENROUTER_API_KEY="sk-or-v1-..."   # get one at openrouter.ai/keys
 chmod +x junction.py
-./junction.py models --free -q gemma
+./junction.py providers
 ```
 
 ## Usage
 
 ```bash
+# what is plugged in
+junction providers
+
 # list models (live from OpenRouter)
 junction models --free -q gemma
 
-# ask one model
+# ask one model (bare id = default provider)
 junction ask google/gemma-3-27b-it:free "Explain covered calls like I'm five"
 
 # let OpenRouter pick an available free model
@@ -43,7 +47,39 @@ junction show research
 junction usage
 ```
 
-## Free tier
+## Plugging in another provider
+
+Any OpenAI-compatible chat-completions API works. Add it to
+`~/.config/llm-junction/providers.json`:
+
+```json
+{
+  "default": "openrouter",
+  "providers": {
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "key_env": "OPENROUTER_API_KEY"
+    },
+    "xai": {
+      "base_url": "https://api.x.ai/v1",
+      "key_env": "XAI_API_KEY"
+    },
+    "gemini": {
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "key_env": "GEMINI_API_KEY"
+    }
+  }
+}
+```
+
+Then address its models directly:
+
+```bash
+export XAI_API_KEY="..."
+junction ask xai::grok-4 "Second opinion please" --allow-paid
+```
+
+## Free tier (OpenRouter)
 
 OpenRouter's free tier needs no credit card. Models whose IDs end in `:free`
 cost nothing: **20 requests/min, 50/day** (rises to 1,000/day after a one-time
@@ -52,8 +88,7 @@ whichever free model is currently available.
 
 The free bench is open-weight models (Gemma, Llama, Qwen, Mistral, …) and the
 lineup churns — list live with `junction models --free` rather than pinning
-one forever. Flagship models (Grok, Gemini Pro, Claude, GPT) are paid-only on
-OpenRouter; pass `--allow-paid` to call them (bills per token to your balance).
+one forever.
 
 ## Guardrails
 
@@ -61,8 +96,8 @@ OpenRouter; pass `--allow-paid` to call them (bills per token to your balance).
 - `usage` shows today's request count against the daily cap (default 50,
   configurable in `~/.config/llm-junction/config.json`).
 - Threads persist under `~/.config/llm-junction/threads/`.
-- The key is read from `OPENROUTER_API_KEY` at runtime and never written to
-  disk, logs, or chat.
+- Each provider's key is read from its configured environment variable at
+  runtime and never written to disk, logs, or chat.
 
 ## Why it exists
 

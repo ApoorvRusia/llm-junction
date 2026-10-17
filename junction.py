@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""junction -- talk to other LLMs through OpenRouter.
+"""junction -- a switchboard for talking to other LLMs.
 
-One command to consult many models (Gemini/Gemma, Llama, Qwen, Mistral, ...)
-through a single OpenRouter API key. Free-tier-first: it defaults to free
-models and refuses paid ones unless you say otherwise.
+The idea: one agent or system that has no direct access to other LLMs plugs
+into the junction, and the junction connects it to whichever models are
+plugged in on the other side. Providers are pluggable -- OpenRouter ships as
+the first one (300+ models through a single key); any OpenAI-compatible API
+(xAI, OpenAI, Gemini's OpenAI endpoint, ...) can be added in providers.json
+and is then addressable as provider::model.
 
 Setup:
   export OPENROUTER_API_KEY="sk-or-v1-..."   # from openrouter.ai/keys
 
-The API key is NEVER in this file. It is read from the OPENROUTER_API_KEY
-environment variable at runtime.
+Each provider's key is read from its configured environment variable at
+runtime. Keys are NEVER in this file.
 
 Commands:
-  models [--free] [-q QUERY]           list models (live from OpenRouter)
+  providers                            list connected LLM providers
   ask MODEL "prompt" [options]         ask one model; --thread NAME keeps history
   thread NAME "follow-up"              continue a saved thread with its model
   threads                             list saved threads
@@ -20,6 +23,9 @@ Commands:
   rm-thread THREAD                    delete a thread
   roundtable "prompt" [--models a,b,c]  ask several models, compare answers
   usage                               today's request count vs the daily cap
+
+Addressing: 'provider::model' (e.g. xai::grok-4) or a bare model id, which
+uses the default provider (openrouter).
 
 Free-tier guardrails (default ON):
   - model ids must end in :free (or be openrouter/free); pass --allow-paid
@@ -56,6 +62,54 @@ USAGE_PATH = os.path.join(HOME, "usage.jsonl")
 
 FREE_ROUTER = "openrouter/free"
 
+PROVIDERS_PATH = os.path.join(HOME, "providers.json")
+
+
+def _default_providers() -> dict:
+    return {
+        "default": "openrouter",
+        "providers": {
+            "openrouter": {
+                "base_url": BASE,
+                "key_env": "OPENROUTER_API_KEY",
+                "note": "300+ models; :free tier available",
+            },
+        },
+    }
+
+
+def _providers() -> dict:
+    try:
+        if os.path.exists(PROVIDERS_PATH):
+            with open(PROVIDERS_PATH) as f:
+                doc = json.load(f)
+            if isinstance(doc.get("providers"), dict):
+                return doc
+    except (OSError, ValueError):
+        pass
+    return _default_providers()
+
+
+def _resolve(model_arg: str) -> tuple:
+    """Split 'provider::model' into (provider, config, model id).
+
+    A bare model id uses the default provider (openrouter), so
+    'google/gemma-3-27b-it:free' and 'openrouter/free' keep working.
+    """
+    provs = _providers()
+    if "::" in model_arg:
+        name, mid = model_arg.split("::", 1)
+        if name not in provs["providers"]:
+            known = ", ".join(sorted(provs["providers"]))
+            raise RuntimeError(
+                f"unknown provider '{name}'. Known providers: {known} "
+                f"(see: junction providers)")
+        if not mid:
+            raise RuntimeError(f"missing model id after '{name}::'")
+        return name, provs["providers"][name], mid
+    default = provs.get("default", "openrouter")
+    return default, provs["providers"][default], model_arg
+
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args):
@@ -81,22 +135,30 @@ def _read_json_response(response) -> dict:
         raise RuntimeError("provider response was not valid JSON") from exc
 
 
-def _apply_auth(request: urllib.request.Request) -> None:
-    """Attach the OpenRouter API key: env var first, Muse surrogate fallback."""
-    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+def _apply_auth(request: urllib.request.Request, prov_name: str = "openrouter",
+                prov: dict | None = None) -> None:
+    """Attach a provider's API key: its key_env var first, surrogate fallback."""
+    prov = prov or {}
+    key_env = prov.get("key_env", "OPENROUTER_API_KEY")
+    key = os.environ.get(key_env, "").strip()
     if key:
         request.add_header("Authorization", f"Bearer {key}")
         return
-    try:
-        sys.path.insert(0, "/opt/muse/skills/custom-connector-setup/bin")
-        from dynamic_credentials import add_surrogate_to_request
-    except ImportError:
-        raise RuntimeError(
-            "No API key found. Set the OPENROUTER_API_KEY environment variable "
-            "(get a key at https://openrouter.ai/keys)."
-        )
-    add_surrogate_to_request(request, "custom.openrouter",
-                             allowed_hosts=ALLOWED_HOSTS)
+    if prov_name == "openrouter":
+        # Muse runtime: the key lives in the Secure Vault; use the surrogate.
+        try:
+            sys.path.insert(0, "/opt/muse/skills/custom-connector-setup/bin")
+            from dynamic_credentials import add_surrogate_to_request
+        except ImportError:
+            pass
+        else:
+            add_surrogate_to_request(request, "custom.openrouter",
+                                     allowed_hosts=ALLOWED_HOSTS)
+            return
+    raise RuntimeError(
+        f"No API key for provider '{prov_name}'. Set the {key_env} "
+        f"environment variable and retry."
+    )
 
 
 def _config() -> dict:
@@ -145,27 +207,28 @@ def _today_count() -> int:
     return n
 
 
-def _friendly_http_error(url: str, exc: urllib.error.HTTPError) -> RuntimeError:
+def _friendly_http_error(url: str, exc: urllib.error.HTTPError,
+                         provider: str = "OpenRouter") -> RuntimeError:
     try:
         body = exc.read().decode("utf-8", errors="replace")[:500]
     except Exception:
         body = ""
     if exc.code == 401:
         return RuntimeError(
-            "OpenRouter rejected the credential (401). The stored key may be wrong "
-            "or revoked -- create a fresh key at openrouter.ai/keys and reconnect."
+            f"{provider} rejected the credential (401). The key may be wrong "
+            f"or revoked -- create a fresh one and retry."
         )
     if exc.code == 402:
         return RuntimeError(
-            "OpenRouter returned 402: no spendable balance / credit limit hit. "
-            "Free models need the account balance at $0 or above. " + body
+            f"{provider} returned 402: no spendable balance / credit limit hit. "
+            + body
         )
     if exc.code == 429:
         return RuntimeError(
-            "Rate limited (429) by OpenRouter or the upstream provider. "
-            "Wait a bit, or try another :free model. " + body
+            f"Rate limited (429) by {provider} or its upstream. "
+            f"Wait a bit and retry. " + body
         )
-    return RuntimeError(f"OpenRouter HTTP {exc.code} on {url}: {body}")
+    return RuntimeError(f"{provider} HTTP {exc.code} on {url}: {body}")
 
 
 def _request(url: str, payload: dict | None = None, authed: bool = True,
@@ -269,13 +332,29 @@ def cmd_models(args) -> int:
     return 0
 
 
-def _chat(model: str, messages: list, max_tokens: int) -> tuple[str, str]:
-    payload = {"model": model, "messages": messages, "max_tokens": max_tokens}
-    doc = _request_with_retry(BASE + "/chat/completions", payload)
+def _post_chat(prov_name: str, prov: dict, model_id: str, messages: list,
+               max_tokens: int, timeout: int = 120) -> tuple[str, str]:
+    """POST one chat completion to the given provider (OpenAI-compatible)."""
+    url = prov["base_url"].rstrip("/") + "/chat/completions"
+    _ensure_allowed_url(url)
+    payload = {"model": model_id, "messages": messages, "max_tokens": max_tokens}
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://muse.ai",
+        "X-Title": "Clarke LLM Junction",
+    }, method="POST")
+    _apply_auth(req, prov_name, prov)
+    opener = urllib.request.build_opener(NoRedirect())
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            doc = _read_json_response(resp)
+    except urllib.error.HTTPError as exc:
+        raise _friendly_http_error(url, exc, prov_name)
     try:
         choice = doc["choices"][0]["message"]
         text = (choice.get("content") or "").strip()
-        used_model = doc.get("model", model)
+        used_model = doc.get("model", model_id)
     except (KeyError, IndexError, TypeError):
         raise RuntimeError(f"unexpected completion response: {str(doc)[:300]}")
     if not text:
@@ -286,6 +365,27 @@ def _chat(model: str, messages: list, max_tokens: int) -> tuple[str, str]:
             text = ("[model returned no final answer; showing its reasoning trace]\n"
                     + reasoning.strip()[:3000])
     return used_model, text.strip()
+
+
+def _chat(model_arg: str, messages: list, max_tokens: int) -> tuple[str, str]:
+    """Chat via 'provider::model' or a bare model id (default provider)."""
+    prov_name, prov, model_id = _resolve(model_arg)
+    delay = 2.0
+    last: Exception | None = None
+    for _ in range(3):
+        try:
+            used, text = _post_chat(prov_name, prov, model_id, messages,
+                                    max_tokens)
+            if prov_name != "openrouter":
+                used = f"{prov_name}::{used}"
+            return used, text
+        except RuntimeError as exc:
+            last = exc
+            if "Rate limited (429)" not in str(exc):
+                raise
+            time.sleep(delay)
+            delay *= 2
+    raise last  # type: ignore[misc]
 
 
 def cmd_ask(args) -> int:
@@ -408,6 +508,26 @@ def cmd_roundtable(args) -> int:
     return 0
 
 
+def cmd_providers(_args) -> int:
+    provs = _providers()
+    print(f"default provider: {provs.get('default', 'openrouter')}")
+    print(f"config file: {PROVIDERS_PATH}\n")
+    for name, p in provs["providers"].items():
+        key_env = p.get("key_env", "")
+        key_state = "set" if os.environ.get(key_env, "").strip() else "missing"
+        print(f"  {name}")
+        print(f"    base_url: {p.get('base_url')}")
+        print(f"    key: {key_env} [{key_state}]")
+        if p.get("note"):
+            print(f"    {p['note']}")
+    print("\nPlug in another OpenAI-compatible provider by editing providers.json:")
+    print('  "xai": {"base_url": "https://api.x.ai/v1", "key_env": "XAI_API_KEY",')
+    print('          "note": "Grok models"}')
+    print("then call it as:  junction ask xai::grok-4 \"...\" --allow-paid")
+    print("Model ids without '::' keep using the default provider.")
+    return 0
+
+
 def cmd_usage(_args) -> int:
     cfg = _config()
     used = _today_count()
@@ -470,6 +590,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("usage", help="today's free-tier request count")
     s.set_defaults(fn=cmd_usage)
+
+    s = sub.add_parser("providers", help="list connected LLM providers")
+    s.set_defaults(fn=cmd_providers)
     return p
 
 
