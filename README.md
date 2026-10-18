@@ -8,6 +8,25 @@ plugged in on the other side. Providers are pluggable — OpenRouter ships as
 the first one (300+ models through a single key); any OpenAI-compatible API
 can be added and is then addressable as `provider::model`.
 
+## How it works
+
+```mermaid
+flowchart TD
+    A["Agent or system<br/><i>no direct access to other LLMs</i>"] --> B["<b>LLM Junction</b><br/>junction CLI"]
+    B --> C["Provider registry<br/><i>providers.json</i>"]
+    C --> D["OpenRouter<br/>300+ models"]
+    C --> E["xAI<br/>Grok"]
+    C --> F["OpenAI<br/>GPT"]
+    C --> G["Gemini<br/>OpenAI-compatible endpoint"]
+    D --> H["Gemma · Llama · Qwen<br/>Mistral · Nemotron · ..."]
+    H --> I["Answers flow back<br/>to the agent"]
+    E --> I
+    F --> I
+    G --> I
+    B -.-> J["Guardrails<br/>free-tier by default<br/>paid needs --allow-paid"]
+    B -.-> K["Threads & usage log<br/><i>~/.config/llm-junction/</i>"]
+```
+
 ## Setup
 
 No dependencies — Python 3.10+ and the standard library only.
