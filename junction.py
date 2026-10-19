@@ -55,6 +55,13 @@ import urllib.request
 BASE = "https://openrouter.ai/api/v1"
 ALLOWED_HOSTS = ["openrouter.ai"]
 
+# Provider name -> Secure Vault custom connection for the surrogate fallback.
+# Keys live in the vault, never in files; the junction only sees a surrogate.
+VAULT_CONNECTIONS = {
+    "openrouter": "custom.openrouter",
+    "google-aistudio": "custom.google-aistudio",
+}
+
 HOME = os.path.expanduser("~/.config/llm-junction")
 THREADS_DIR = os.path.join(HOME, "threads")
 CONFIG_PATH = os.path.join(HOME, "config.json")
@@ -118,8 +125,13 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def _ensure_allowed_url(url: str) -> None:
     host = (urllib.parse.urlparse(url).hostname or "").lower()
-    if host not in ALLOWED_HOSTS:
-        raise RuntimeError(f"refusing request to {host}; allowed: {ALLOWED_HOSTS}")
+    allowed = set(ALLOWED_HOSTS)
+    for p in _providers().get("providers", {}).values():
+        h = (urllib.parse.urlparse(p.get("base_url", "")).hostname or "").lower()
+        if h:
+            allowed.add(h)
+    if host not in allowed:
+        raise RuntimeError(f"refusing request to {host}; allowed: {sorted(allowed)}")
 
 
 def _read_json_response(response) -> dict:
@@ -135,6 +147,12 @@ def _read_json_response(response) -> dict:
         raise RuntimeError("provider response was not valid JSON") from exc
 
 
+def _allowed_hosts_for(prov: dict) -> list:
+    """Hosts the surrogate exchange may target: the provider's own host."""
+    h = (urllib.parse.urlparse(prov.get("base_url", "")).hostname or "").lower()
+    return [h] if h else list(ALLOWED_HOSTS)
+
+
 def _apply_auth(request: urllib.request.Request, prov_name: str = "openrouter",
                 prov: dict | None = None) -> None:
     """Attach a provider's API key: its key_env var first, surrogate fallback."""
@@ -144,7 +162,7 @@ def _apply_auth(request: urllib.request.Request, prov_name: str = "openrouter",
     if key:
         request.add_header("Authorization", f"Bearer {key}")
         return
-    if prov_name == "openrouter":
+    if prov_name in VAULT_CONNECTIONS:
         # Muse runtime: the key lives in the Secure Vault; use the surrogate.
         try:
             sys.path.insert(0, "/opt/muse/skills/custom-connector-setup/bin")
@@ -152,8 +170,8 @@ def _apply_auth(request: urllib.request.Request, prov_name: str = "openrouter",
         except ImportError:
             pass
         else:
-            add_surrogate_to_request(request, "custom.openrouter",
-                                     allowed_hosts=ALLOWED_HOSTS)
+            add_surrogate_to_request(request, VAULT_CONNECTIONS[prov_name],
+                                     allowed_hosts=_allowed_hosts_for(prov))
             return
     raise RuntimeError(
         f"No API key for provider '{prov_name}'. Set the {key_env} "
@@ -269,8 +287,11 @@ def _request_with_retry(url: str, payload: dict, tries: int = 3) -> dict:
     raise last  # type: ignore[misc]
 
 
-def _guard_free(model: str, allow_paid: bool) -> None:
+def _guard_free(model: str, allow_paid: bool, prov_name: str = "openrouter") -> None:
     if allow_paid:
+        return
+    if prov_name != "openrouter":
+        # Bring-your-own-key provider: the key owner accepts the cost.
         return
     if model == FREE_ROUTER or model.endswith(":free"):
         return
@@ -389,7 +410,8 @@ def _chat(model_arg: str, messages: list, max_tokens: int) -> tuple[str, str]:
 
 
 def cmd_ask(args) -> int:
-    _guard_free(args.model, args.allow_paid)
+    _guard_free(args.model, args.allow_paid,
+                args.model.split("::", 1)[0] if "::" in args.model else "openrouter")
     prompt = args.prompt
     if args.file:
         with open(args.file) as f:
@@ -427,7 +449,8 @@ def cmd_ask(args) -> int:
 def cmd_thread(args) -> int:
     t = _load_thread(args.name)
     model = t.get("model") or _config()["default_model"]
-    _guard_free(model, args.allow_paid)
+    _guard_free(model, args.allow_paid,
+                model.split("::", 1)[0] if "::" in model else "openrouter")
     messages = list(t.get("messages", []))
     messages.append({"role": "user", "content": args.prompt})
     try:
@@ -486,7 +509,8 @@ def cmd_rm_thread(args) -> int:
 def cmd_roundtable(args) -> int:
     models = [m.strip() for m in args.models.split(",") if m.strip()] or [FREE_ROUTER]
     for m in models:
-        _guard_free(m, args.allow_paid)
+        _guard_free(m, args.allow_paid,
+                    m.split("::", 1)[0] if "::" in m else "openrouter")
     messages = []
     if args.system:
         messages.append({"role": "system", "content": args.system})
