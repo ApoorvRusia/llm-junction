@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Run the 40 CampaignIQ eval questions against one OpenRouter :free model.
+"""Run the 40 CampaignIQ eval questions against one model via the junction.
 
 Usage:
   python3 campaigniq_free_eval.py <model-id> [--outdir DIR] [--max-tokens N]
 
+<model-id> may be 'provider::model' (e.g. google-aistudio::gemma-4-31b-it)
+or a bare OpenRouter id (default provider).
+
 - One request per question, fresh context each (setup prompt as system msg),
   mirroring the eval doc's fresh-chat rule. No threads.
-- 5s spacing between requests (stays under 20 req/min).
+- 5s spacing between requests (7s on google-aistudio, staying under 10 req/min).
 - Validates Q1: aborts if the answer is empty or reasoning-only.
 - Saves incrementally to JSONL; rerunning resumes unfinished questions.
 - On daily-cap 429s it stops gracefully; rerun later/tomorrow to resume.
@@ -48,13 +51,15 @@ def answer_is_usable(text):
     return True
 
 
-def ask_once(model, messages, max_tokens):
+def ask_once(prov_name, prov, model_id, messages, max_tokens):
     """Single attempt, no internal retry. Returns (text, error)."""
+    url = prov["base_url"].rstrip("/") + "/chat/completions"
     try:
-        doc = j._request(j.BASE + "/chat/completions",
-                         {"model": model, "messages": messages,
+        doc = j._request(url,
+                         {"model": model_id, "messages": messages,
                           "max_tokens": max_tokens},
-                         authed=True, timeout=120)
+                         authed=True, timeout=120,
+                         prov_name=prov_name, prov=prov)
         choice = doc["choices"][0]["message"]
         text = (choice.get("content") or "").strip()
         if not text:
@@ -62,13 +67,15 @@ def ask_once(model, messages, max_tokens):
             if isinstance(reasoning, str) and reasoning.strip():
                 text = ("[model returned no final answer; showing its reasoning trace]\n"
                         + reasoning.strip()[:3000])
-        return text, doc.get("model", model), None
+        return text, doc.get("model", model_id), None
     except RuntimeError as exc:
-        return "", model, str(exc)
+        return "", model_id, str(exc)
 
 
 def main():
-    model = sys.argv[1]
+    model_arg = sys.argv[1]
+    prov_name, prov, model_id = j._resolve(model_arg)
+    spacing = 7 if prov_name == "google-aistudio" else 5
     outdir = os.path.join(
         "/home/hatch/workspace/goals/project-ai-learning/files/campaigniq-free-eval",
         *[a.split("=", 1)[1] for a in sys.argv if a.startswith("--outdir=")] or ["runs"])
@@ -77,7 +84,7 @@ def main():
         if a.startswith("--max-tokens="):
             max_tokens = int(a.split("=", 1)[1])
     os.makedirs(outdir, exist_ok=True)
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", model).strip("-")
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", model_arg).strip("-")
     jsonl_path = os.path.join(outdir, f"{slug}.jsonl")
 
     setup, questions = load_eval()
@@ -90,7 +97,7 @@ def main():
                     done[e["qid"]] = e
                 except ValueError:
                     pass
-    print(f"model={model} done={len(done)}/40 jsonl={jsonl_path}", flush=True)
+    print(f"model={model_arg} provider={prov_name} done={len(done)}/40 jsonl={jsonl_path}", flush=True)
 
     daily_cap_hit = False
     for qid, qtext in questions:
@@ -100,13 +107,13 @@ def main():
             break
         messages = [{"role": "system", "content": setup},
                     {"role": "user", "content": qtext}]
-        text, used_model, err = ask_once(model, messages, max_tokens)
+        text, used_model, err = ask_once(prov_name, prov, model_id, messages, max_tokens)
         if err and "429" in err:
             # Rate limited (account daily cap or upstream saturation).
             # One patient retry after 90s, then stop gracefully and resume later.
             print(f"{qid}: 429 ({err[:80]}), waiting 90s once", flush=True)
             time.sleep(90)
-            text, used_model, err = ask_once(model, messages, max_tokens)
+            text, used_model, err = ask_once(prov_name, prov, model_id, messages, max_tokens)
             if err and "429" in err:
                 print(f"{qid}: still rate limited, stopping gracefully. "
                       f"Rerun the same command to resume.", flush=True)
@@ -115,7 +122,7 @@ def main():
         if err:
             print(f"{qid}: ERROR {err[:120]}", flush=True)
             entry = {"qid": qid, "question": qtext, "answer": "",
-                     "error": err[:300], "model": model}
+                     "error": err[:300], "model": model_arg}
         else:
             if qid == "P-01" and not answer_is_usable(text):
                 print(f"Q1 answer unusable, aborting run:\n{text[:300]}",
@@ -130,9 +137,9 @@ def main():
                      "model": used_model}
         with open(jsonl_path, "a") as f:
             f.write(json.dumps(entry) + "\n")
-        j._log_usage(used_model if not err else model, not err,
+        j._log_usage(used_model if not err else model_arg, not err,
                      (err or "")[:120])
-        time.sleep(5)
+        time.sleep(spacing)
 
     # Compile readable markdown from everything saved so far.
     entries = {}

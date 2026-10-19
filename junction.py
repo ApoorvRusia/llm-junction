@@ -250,7 +250,8 @@ def _friendly_http_error(url: str, exc: urllib.error.HTTPError,
 
 
 def _request(url: str, payload: dict | None = None, authed: bool = True,
-             timeout: int = 60) -> dict:
+             timeout: int = 60, prov_name: str = "openrouter",
+             prov: dict | None = None) -> dict:
     _ensure_allowed_url(url)
     data = None
     headers = {
@@ -263,7 +264,7 @@ def _request(url: str, payload: dict | None = None, authed: bool = True,
     req = urllib.request.Request(url, data=data, headers=headers,
                                  method="POST" if data else "GET")
     if authed:
-        _apply_auth(req)
+        _apply_auth(req, prov_name=prov_name, prov=prov)
     opener = urllib.request.build_opener(NoRedirect())
     try:
         with opener.open(req, timeout=timeout) as resp:
